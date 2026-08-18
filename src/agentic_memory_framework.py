@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Protocol
 import hashlib
 import math
+import json
+import os
 import re
+from urllib import request, error
 
 
 class MemoryType(str, Enum):
@@ -183,6 +186,94 @@ class MemoryRetriever:
         return ranked[:top_k]
 
 
+class ExternalMemoryProvider(Protocol):
+    name: str
+
+    def upsert(self, entry: MemoryEntry) -> None:
+        ...
+
+    def search(self, issue: Issue, top_k: int = 5) -> List[MemoryEntry]:
+        ...
+
+
+class HTTPExtMemoryProvider:
+    def __init__(self, name: str, base_url: str, api_key: Optional[str] = None) -> None:
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def upsert(self, entry: MemoryEntry) -> None:
+        payload = {
+            "id": entry.memory_id,
+            "type": entry.memory_type,
+            "issue_id": entry.issue_id,
+            "content": entry.content,
+            "tags": entry.tags,
+            "confidence": entry.confidence,
+            "success_rate": entry.success_rate,
+            "source": entry.source,
+        }
+        self._post_json("/memories/upsert", payload)
+
+    def search(self, issue: Issue, top_k: int = 5) -> List[MemoryEntry]:
+        payload = {"issue_id": issue.issue_id, "context": issue.context, "top_k": top_k}
+        data = self._post_json("/memories/search", payload)
+        if not isinstance(data, list):
+            return []
+        memories: List[MemoryEntry] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                memories.append(
+                    MemoryEntry(
+                        memory_id=str(item.get("id", "")),
+                        memory_type=MemoryType(str(item.get("type", MemoryType.EPISODIC))),
+                        issue_id=str(item.get("issue_id", issue.issue_id)),
+                        content=str(item.get("content", "")),
+                        tags=[str(t) for t in item.get("tags", []) if isinstance(t, str)],
+                        confidence=float(item.get("confidence", 0.5)),
+                        success_rate=float(item.get("success_rate", 0.5)),
+                        source=str(item.get("source", self.name)),
+                    )
+                )
+            except (ValueError, TypeError):
+                continue
+        return memories
+
+    def _post_json(self, path: str, payload: Dict) -> object:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        req = request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=2.5) as response:
+                raw = response.read().decode("utf-8")
+                if not raw:
+                    return {}
+                return json.loads(raw)
+        except (error.URLError, error.HTTPError, json.JSONDecodeError):
+            return {}
+
+
+def build_configured_providers() -> List[ExternalMemoryProvider]:
+    providers: List[ExternalMemoryProvider] = []
+    cognee_url = os.getenv("COGNEE_BASE_URL")
+    cognee_key = os.getenv("COGNEE_API_KEY")
+    memoryai_url = os.getenv("MEMORYAI_BASE_URL")
+    memoryai_key = os.getenv("MEMORYAI_API_KEY")
+    if cognee_url:
+        providers.append(HTTPExtMemoryProvider("cognee", cognee_url, cognee_key))
+    if memoryai_url:
+        providers.append(HTTPExtMemoryProvider("memoryai", memoryai_url, memoryai_key))
+    return providers
+
+
 class AgenticMemoryFramework:
     """Issue-improvement workflow powered by agentic memory."""
 
@@ -200,9 +291,10 @@ class AgenticMemoryFramework:
         "framework_audit": "quarterly",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, providers: Optional[List[ExternalMemoryProvider]] = None) -> None:
         self.store = MemoryStore()
         self.metrics = SuccessMetrics()
+        self.providers = providers or build_configured_providers()
 
     def ingest_issue(self, issue: Issue) -> None:
         self.store.mark_issue_seen(issue.issue_id)
@@ -210,7 +302,11 @@ class AgenticMemoryFramework:
             self.metrics.recurrence_count += 1
 
     def retrieve_memories(self, issue: Issue, top_k: int = 5) -> List[MemoryEntry]:
-        return MemoryRetriever.rank(issue, self.store.all_entries(), top_k=top_k)
+        local_entries = self.store.all_entries()
+        external_entries: List[MemoryEntry] = []
+        for provider in self.providers:
+            external_entries.extend(provider.search(issue, top_k=top_k))
+        return MemoryRetriever.rank(issue, [*local_entries, *external_entries], top_k=top_k)
 
     def propose_actions(self, issue: Issue, memories: List[MemoryEntry]) -> List[str]:
         actions = []
@@ -334,6 +430,8 @@ class AgenticMemoryFramework:
             source=source,
         )
         self.store.upsert(entry)
+        for provider in self.providers:
+            provider.upsert(entry)
         return memory_id
 
 
